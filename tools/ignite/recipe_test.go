@@ -27,6 +27,59 @@ func TestParseSourceSpec(t *testing.T) {
 	}
 }
 
+func TestApplyPatchFileHandlesBundledSequentialPatches(t *testing.T) {
+	tmp := t.TempDir()
+	root := filepath.Join(tmp, "root")
+	nested := filepath.Join(root, "pkg-1.0")
+	if err := os.MkdirAll(nested, 0755); err != nil {
+		t.Fatal(err)
+	}
+	file := filepath.Join(nested, "hello.txt")
+	if err := os.WriteFile(file, []byte("one\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	patch := filepath.Join(tmp, "bundle.patch")
+	data := `From 1111111111111111111111111111111111111111 Mon Sep 17 00:00:00 2001
+Subject: [PATCH 1/2] one to two
+---
+ hello.txt | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/hello.txt b/hello.txt
+--- a/hello.txt
++++ b/hello.txt
+@@ -1 +1 @@
+-one
++two
+
+From 2222222222222222222222222222222222222222 Mon Sep 17 00:00:00 2001
+Subject: [PATCH 2/2] two to three
+---
+ hello.txt | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/hello.txt b/hello.txt
+--- a/hello.txt
++++ b/hello.txt
+@@ -1 +1 @@
+-two
++three
+`
+	if err := os.WriteFile(patch, []byte(data), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := applyPatchFile(patch, root); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "three\n" {
+		t.Fatalf("patch bundle was not applied sequentially: %q", got)
+	}
+}
+
 func TestAppendSourcesToRecipeTextExistingBlock(t *testing.T) {
 	input := "id: pkg\nversion: 1\nsources:\n  - https://example.invalid/pkg.tar.xz\nscript: |\n  true\n"
 	got := appendSourcesToRecipeText(input, []string{"patches/pkg/0001-fix.patch", "patches/pkg/0002-next.patch"})

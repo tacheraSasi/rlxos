@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -89,8 +90,23 @@ func NewIgnite(config *Config, projectPath, cachePath, workspacePath, arch strin
 	return i, nil
 }
 
+func (i *Ignite) virtualMergeFiles() map[string][]byte {
+	version := configString(*i.config, "version", "9999")
+	channel := "testing"
+	if variables := i.config.ScalarMap("variables"); variables != nil {
+		if value := variables["channel"]; value != "" {
+			channel = value
+		}
+	}
+	return map[string][]byte{
+		"version.yml": []byte(fmt.Sprintf("version: %s\nvariables:\n  channel: %s\n", version, channel)),
+		"channel.yml": []byte(fmt.Sprintf("variables:\n  channel: %s\n", channel)),
+	}
+}
+
 func (i *Ignite) Load() error {
 	root := filepath.Join(i.projectPath, "elements")
+	nextPool := map[string]Recipe{}
 	err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, err error) error {
 		if err != nil {
 			return err
@@ -100,16 +116,20 @@ func (i *Ignite) Load() error {
 		}
 		rel, _ := filepath.Rel(root, path)
 		rel = filepath.ToSlash(rel)
-		recipe, err := LoadRecipe(path, i.projectPath)
+		recipe, err := LoadRecipe(path, i.projectPath, i.virtualMergeFiles())
 		if err != nil {
 			return fmt.Errorf("failed to load %q because %w", rel, err)
 		}
-		i.pool[rel] = recipe
+		nextPool[rel] = recipe
 		return nil
 	})
 	if err != nil {
 		return err
 	}
+	i.pool = nextPool
+	i.hashMu.Lock()
+	i.hashCache = map[string]string{}
+	i.hashMu.Unlock()
 	fmt.Printf("Ignite::load(): Loaded %d elements\n", len(i.pool))
 	return nil
 }
@@ -242,12 +262,46 @@ func (i *Ignite) WorkspaceCacheFile(recipe Recipe) string {
 	return filepath.Join(i.cachePath, "cache", workspacePackageName(recipe))
 }
 
+func (i *Ignite) NeedsContainer(recipe Recipe) (bool, error) {
+	visited := map[string]bool{}
+	var dfs func(Recipe) (bool, error)
+	dfs = func(current Recipe) (bool, error) {
+		key := elementName(current)
+		if visited[key] {
+			return false, nil
+		}
+		visited[key] = true
+		if current.config.Bool("container", false) {
+			return true, nil
+		}
+		for _, dep := range current.depends {
+			depRecipe, ok := i.pool[dep]
+			if !ok {
+				return false, fmt.Errorf("missing required runtime dependency %q for %s", dep, current.id)
+			}
+			need, err := dfs(depRecipe)
+			if err != nil {
+				return false, err
+			}
+			if need {
+				return true, nil
+			}
+		}
+		return false, nil
+	}
+	return dfs(recipe)
+}
+
 func (i *Ignite) SetupContainer(recipe Recipe, typ ContainerType) (Container, error) {
+	useContainer, err := i.NeedsContainer(recipe)
+	if err != nil {
+		return Container{}, err
+	}
 	env := []string{"NOCONFIGURE=1", "HOME=/", "SHELL=/bin/sh", "TERM=dumb", "USER=nishu", "LOGNAME=nishu", "LC_ALL=C", "TZ=UTC", "SOURCE_DATE_EPOCH=918239400", "PKGSYSTEM_ENABLE_FSYNC=0"}
 	env = append(env, i.config.StringSlice("environ")...)
 	env = append(env, recipe.config.StringSlice("environ")...)
-	ccache := i.config.Bool("ccache", true)
-	if recipe.config.Has("ccache") {
+	ccache := useContainer && i.config.Bool("ccache", true)
+	if useContainer && recipe.config.Has("ccache") {
 		ccache = recipe.config.Bool("ccache", true)
 	}
 	hostRoot := filepath.Join(i.cachePath, "temp", recipe.PackageName(recipe.elementID))
@@ -269,12 +323,18 @@ func (i *Ignite) SetupContainer(recipe Recipe, typ ContainerType) (Container, er
 		binds = append(binds, [2]string{"/ccache", filepath.Join(i.cachePath, "ccache")})
 	}
 	c := Container{
+		enabled:      useContainer,
 		environ:      env,
 		binds:        binds,
 		capabilities: recipe.config.StringSlice("capabilities"),
 		hostRoot:     hostRoot,
 		baseDir:      i.projectPath,
 		name:         recipe.PackageName(recipe.elementID),
+	}
+	if useContainer {
+		fmt.Println("Ignite::setup(): container enabled for", elementName(recipe))
+	} else {
+		fmt.Println("Ignite::setup(): container disabled for", elementName(recipe))
 	}
 	dirs := []string{"sources", "cache"}
 	if ccache {
@@ -285,6 +345,9 @@ func (i *Ignite) SetupContainer(recipe Recipe, typ ContainerType) (Container, er
 	}
 	i.config.SetString("dir.build", hostRoot)
 	_ = os.MkdirAll(filepath.Join(hostRoot, "usr", "local", "include"), 0755)
+	if !useContainer {
+		return c, nil
+	}
 	if ccache {
 		if err := i.IntegrateCachedTool(&c, "components/ccache.yml"); err != nil {
 			return c, err
@@ -1281,11 +1344,13 @@ func normalizeSourceRef(source string) string {
 func (i *Ignite) CompileSource(recipe Recipe, container *Container, buildRoot, installRoot string) error {
 	env := append([]string{}, i.config.StringSlice("environ")...)
 	env = append(env, recipe.config.StringSlice("environ")...)
-	resolvedInstallRoot := filepath.Join(container.hostRoot, installRoot, recipe.PackageName())
-	resolvedBuildRoot := filepath.Join(container.hostRoot, buildRoot)
+	runtimeInstallRoot := filepath.ToSlash(filepath.Join("/", installRoot, recipe.PackageName()))
+	runtimeBuildRoot := filepath.ToSlash(filepath.Join("/", buildRoot))
+	resolvedInstallRoot := container.HostPath(runtimeInstallRoot)
+	resolvedBuildRoot := container.HostPath(runtimeBuildRoot)
 	extra := map[string]string{
-		"install-root": filepath.ToSlash(filepath.Join("/", installRoot, recipe.PackageName())),
-		"build-root":   filepath.ToSlash(filepath.Join("/", buildRoot)),
+		"install-root": container.RuntimePath(runtimeInstallRoot),
+		"build-root":   container.RuntimePath(runtimeBuildRoot),
 	}
 	if script, _ := recipe.config.String("pre-script", ""); script != "" {
 		resolved, err := recipe.ResolveValue(script, *i.config, extra)
@@ -1659,13 +1724,12 @@ func applyPatchFile(patchPath, root string) error {
 	for _, candidate := range patchCandidateRoots(root) {
 		for _, strip := range stripLevels {
 			stripArg := fmt.Sprintf("-p%d", strip)
-			status, out := NewExecutor("/bin/patch").Arg("-f").Arg("-s").Arg("--dry-run").Arg(stripArg).Arg("-i").Arg(patchPath).Path(candidate).Output()
-			if status != 0 {
-				attempts = append(attempts, fmt.Sprintf("%s %s: %s", candidate, stripArg, out))
+			if err := testPatchApply(patchPath, candidate, stripArg); err != nil {
+				attempts = append(attempts, fmt.Sprintf("%s %s: %s", candidate, stripArg, err))
 				continue
 			}
 			fmt.Printf("Applying source patch: %s in %s with %s\n", filepath.Base(patchPath), candidate, stripArg)
-			if err := NewExecutor("/bin/patch").Arg("-f").Arg(stripArg).Arg("-i").Arg(patchPath).Path(candidate).Execute(); err != nil {
+			if err := runPatchApply(patchPath, candidate, stripArg); err != nil {
 				return err
 			}
 			return nil
@@ -1675,6 +1739,32 @@ func applyPatchFile(patchPath, root string) error {
 		attempts = attempts[:6]
 	}
 	return fmt.Errorf("no matching source tree found under %q for %s; tried %s", root, filepath.Base(patchPath), strings.Join(attempts, "; "))
+}
+
+func testPatchApply(patchPath, candidate, stripArg string) error {
+	tmp, err := os.MkdirTemp("", "ignite-patch-check-*")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(tmp)
+
+	testRoot := filepath.Join(tmp, "source")
+	if err := copyPath(candidate, testRoot); err != nil {
+		return err
+	}
+	return runPatchApply(patchPath, testRoot, stripArg)
+}
+
+func runPatchApply(patchPath, root, stripArg string) error {
+	status, out := NewExecutor("/bin/patch").Arg("-f").Arg("-N").Arg(stripArg).Arg("-i").Arg(patchPath).Path(root).Output()
+	if status != 0 {
+		out = strings.TrimSpace(out)
+		if out == "" {
+			out = fmt.Sprintf("patch exited with status %d", status)
+		}
+		return errors.New(out)
+	}
+	return nil
 }
 
 func isArchive(path string) bool {

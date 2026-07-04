@@ -50,13 +50,27 @@ jobs:
           rm -rf "${CACHE_PATH}/cache/system-*.pkg" "${CACHE_PATH}/cache/system-*.pkg.dbg"
           rm -rf "${CACHE_PATH}/cache/installer-*.pkg" "${CACHE_PATH}/cache/installer-*.pkg.dbg"
 
+      - name: write local.conf
+        run: |
+          cat <<EOF > local.conf.yml
+          arch: x86_64
+          cache-path: ${CACHE_PATH}
+          workspace-path: workspaces
+
+          version: ${VERSION}
+          variables:
+            channel: ${CHANNEL}
+
+          workspace-push: false
+          workspace-message: avyos workspace update
+          EOF
       - name: Build System image
-        run: make  ELEMENT=installer/image.yml
+        run: go run avyos.dev/tools/ignite build installer/image.yml
 
       - name: Build sysext extensions
         run: |-
           for ext in extensions/sdk.yml extensions/qemu.yml extensions/bspwm.yml extensions/nvidia.yml ; do
-            make  ELEMENT=$ext
+            go run avyos.dev/tools/ignite build $ext
           done
         #  elements/extensions/i3.yml elements/extensions/openjdk.yml elements/extensions/sway.yml elements/extensions/wine.yml elements/extensions/wm-kit-x11.yml elements/extensions/wm-kit.yml
 

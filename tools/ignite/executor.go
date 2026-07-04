@@ -6,10 +6,12 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 )
 
 type Container struct {
+	enabled      bool
 	environ      []string
 	binds        [][2]string
 	capabilities []string
@@ -36,6 +38,33 @@ func (c Container) Args() []string {
 		args = append(args, "--setenv", parts[0], value)
 	}
 	return args
+}
+
+func (c Container) HostPath(path string) string {
+	if path == "" || path == "." {
+		return c.hostRoot
+	}
+	if filepath.IsAbs(path) {
+		clean := filepath.Clean(path)
+		if clean == c.hostRoot || strings.HasPrefix(clean, c.hostRoot+string(os.PathSeparator)) {
+			return clean
+		}
+		return filepath.Join(c.hostRoot, strings.TrimPrefix(clean, string(os.PathSeparator)))
+	}
+	return filepath.Join(c.hostRoot, path)
+}
+
+func (c Container) RuntimePath(path string) string {
+	if c.enabled {
+		if path == "" {
+			return "/"
+		}
+		if filepath.IsAbs(path) {
+			return filepath.ToSlash(path)
+		}
+		return filepath.ToSlash(filepath.Join("/", path))
+	}
+	return c.HostPath(path)
 }
 
 type Executor struct {
@@ -84,11 +113,41 @@ func (e *Executor) Container(c *Container) *Executor {
 	if path == "" {
 		path = "/"
 	}
-	args := append(c.Args(), "--chdir", path)
-	e.args = append(args, e.args...)
-	e.path = ""
+	if c.enabled {
+		args := append(c.Args(), "--chdir", path)
+		e.args = append(args, e.args...)
+		e.path = ""
+	} else {
+		e.path = c.HostPath(path)
+		e.environ = mergeEnvironment(c.environ, e.environ)
+	}
 	e.logger = c.logger
 	return e
+}
+
+func mergeEnvironment(base, override []string) []string {
+	if len(base) == 0 {
+		return override
+	}
+	if len(override) == 0 {
+		return base
+	}
+	out := append([]string{}, base...)
+	seen := map[string]int{}
+	for idx, env := range out {
+		key, _, _ := strings.Cut(env, "=")
+		seen[key] = idx
+	}
+	for _, env := range override {
+		key, _, _ := strings.Cut(env, "=")
+		if idx, ok := seen[key]; ok {
+			out[idx] = env
+		} else {
+			seen[key] = len(out)
+			out = append(out, env)
+		}
+	}
+	return out
 }
 
 func (e *Executor) command() *exec.Cmd {
